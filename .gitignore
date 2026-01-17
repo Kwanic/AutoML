@@ -1,0 +1,97 @@
+# Environment variables and sensitive data
+.env
+.env.local
+.env.*.local
+
+# API keys and secrets
+*.key
+*.pem
+secrets/
+config/secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth
+*.pt
+
+# Compressed files
+*.zip
+
+# Test files
+test_*.py
+*_test.py
+
+# Data
+data/dataset1/
+data/dataset2/
+data/dataset3/
+data/dataset4/
+data/dataset5/
+data/dataset6/
+data/dataset7/
+data/dataset8/
+data/dataset9/
+
+*.npy
+
+backup/
+
+charts/
+
+data/
+
+generated_training_functions/
+gpt_debug_responses/
+logs/
+
+trained_models/
+literature_reviews/
+graph/

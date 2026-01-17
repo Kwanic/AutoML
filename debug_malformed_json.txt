@@ -1,0 +1,198 @@
+Original JSON:
+{
+  "model_name": "RealMLP-TD",
+  "training_code": "def train_model(X_train, y_train, X_val, y_val, device, **hyperparams):\n    import torch\n    from torch import nn, optim\n    from torch.utils.data import TensorDataset, DataLoader\n    import math, time, copy\n\n    # Device handling (ALWAYS GPU for training)\n    device = torch.device(device)\n    if not torch.cuda.is_available() or device.type != 'cuda':\n        raise RuntimeError('CUDA GPU is required for training. Pass device=\"cuda\" and ensure a GPU is available.')\n    torch.backends.cudnn.benchmark = True\n\n    # -------------------- Hyperparameters (only accuracy/compression affecting) --------------------\n    lr = float(hyperparams.get('lr', 2e-3))\n    batch_size = int(hyperparams.get('batch_size', 16384))\n    epochs = int(hyperparams.get('epochs', 30))\n    hidden_size = int(hyperparams.get('hidden_size', 256))\n    num_layers = int(hyperparams.get('num_layers', 3))\n    dropout = float(hyperparams.get('dropout', 0.2))\n    weight_decay = float(hyperparams.get('weight_decay', 1e-3))\n    n_frequencies = int(hyperparams.get('n_frequencies', 4))\n    loss_type = hyperparams.get('loss_type', 'ce')\n    focal_gamma = float(hyperparams.get('focal_gamma', 1.5))\n    amp_dtype = hyperparams.get('amp_dtype', 'fp16')  # 'fp16' or 'bf16'\n    grad_clip = float(hyperparams.get('grad_clip', 1.0))\n    patience = int(hyperparams.get('patience', 5))\n    quantization_bits = int(hyperparams.get('quantization_bits', 8))  # 8,16,32\n    quantize_weights = bool(hyperparams.get('quantize_weights', True))\n    quantize_activations = bool(hyperparams.get('quantize_activations', False))\n\n    # Choose autocast dtype\n    amp_torch_dtype = torch.float16 if amp_dtype.lower() == 'fp16' else torch.bfloat16\n\n    # -------------------- Model Definition --------------------\n    class RobustScaler(nn.Module):\n        def __init__(self, in_features, clip_value=3.0, eps=1e-6):\n            super().__init__()\n            self.register_buffer('median', torch.zeros(in_features))\n            self.register_buffer('iqr', torch.ones(in_features))\n            self.clip_value = clip_value\n            self.eps = eps\n        @torch.no_grad()\n        def set_stats(self, median, iqr):\n            iqr_clamped = iqr.clone()\n            iqr_clamped[iqr_clamped < 1e-6] = 1.0\n            self.median.copy_(median)\n            self.iqr.copy_(iqr_clamped)\n        def forward(self, x):\n            z = (x - self.median) / (self.iqr + self.eps)\n            if self.clip_value is not None:\n                z = self.clip_value * torch.tanh(z / self.clip_value)\n            return z\n\n    class NumericEmbedding(nn.Module):\n        def __init__(self, in_features, n_frequencies=4):\n            super().__init__()\n            self.in_features = in_features\n            self.n_frequencies = n_frequencies\n            # Log-spaced periodic frequencies\n            freqs = torch.logspace(math.log10(0.5), math.log10(32.0), steps=n_frequencies)\n            self.register_buffer('freqs', freqs)\n            self.out_dim = in_features * (1 + 2 * n_frequencies)\n            # Diagonal feature-scaling after embedding\n            self.scale = nn.Parameter(torch.ones(self.out_dim))\n        def forward(self, x):  # x: [B, F]\n            B, F = x.shape\n            x_exp = x.unsqueeze(-1)  # [B, F, 1]\n            angles = 2 * math.pi * x_exp * self.freqs.view(1, 1, -1)  # [B, F, nf]\n            s = torch.sin(angles)\n            c = torch.cos(angles)\n            feat = torch.cat([x_exp, s, c], dim=2)  # [B, F, 1 + 2*nf]\n            feat = feat.reshape(B, F * (1 + 2 * self.n_frequencies))  # [B, out_dim]\n            return feat * self.scale  # diagonal feature scaling\n\n    class RealMLPTD(nn.Module):\n        def __init__(self, in_features, num_classes, hidden_size=256, num_layers=3, dropout=0.2, n_frequencies=4, clip_value=3.0):\n            super().__init__()\n            self.scaler = RobustScaler(in_features, clip_value=clip_value)\n            self.embed = NumericEmbedding(in_features, n_frequencies=n_frequencies)\n            layers = []\n            in_dim = self.embed.out_dim\n            for i in range(num_layers):\n                d_in = in_dim if i == 0 else hidden_size\n                d_out = hidden_size\n                layers.append(nn.Linear(d_in, d_out))\n                layers.append(nn.GELU())\n                layers.append(nn.Dropout(dropout))\n            self.backbone = nn.Sequential(*layers)\n            self.head = nn.Linear(hidden_size, num_classes)\n            # Temperature scaling parameter (learned post-training)\n            self.temperature = nn.Parameter(torch.ones(1))\n        def forward(self, x):\n            x = self.scaler(x)\n            x = self.embed(x)\n            x = self.backbone(x)\n            logits = self.head(x)\n            T = torch.clamp(self.temperature, min=1e-3, max=100.0)\n            return logits / T\n\n    # -------------------- Dataset and Stats --------------------\n    num_classes = 3\n    in_features = X_train.shape[1]\n\n    # Ensure dtypes\n    X_train = X_train.contiguous()\n    X_val = X_val.contiguous()\n    y_train = y_train.long().contiguous()\n    y_val = y_val.long().contiguous()\n\n    # Compute robust stats on CPU to save GPU memory\n    with torch.no_grad():\n        Xtr_cpu = X_train.float()\n        median = torch.median(Xtr_cpu, dim=0).values\n        q25, q75 = torch.quantile(Xtr_cpu, torch.tensor([0.25, 0.75]), dim=0)\n        iqr = q75 - q25\n\n    # Build model and set stats\n    model = RealMLPTD(in_features=in_features, num_classes=num_classes,\n                      hidden_size=hidden_size, num_layers=num_layers,\n                      dropout=dropout, n_frequencies=n_frequencies, clip_value=3.0)\n    model.to(device)\n    with torch.no_grad():\n        model.scaler.set_stats(median.to(device), iqr.to(device))\n\n    # DataLoaders with CUDA-friendly settings\n    mp_ctx = torch.multiprocessing.get_context('spawn')\n    num_workers = 8\n    train_ds = TensorDataset(X_train, y_train)\n    val_ds = TensorDataset(X_val, y_val)\n    train_loader = DataLoader(\n        train_ds,\n        batch_size=batch_size,\n        shuffle=True,\n        num_workers=num_workers,\n        pin_memory=True,\n        persistent_workers=True,\n        prefetch_factor=2,\n        multiprocessing_context=mp_ctx,\n        drop_last=False,\n    )\n    val_loader = DataLoader(\n        val_ds,\n        batch_size=batch_size,\n        shuffle=False,\n        num_workers=num_workers,\n        pin_memory=True,\n        persistent_workers=True,\n        prefetch_factor=2,\n        multiprocessing_context=mp_ctx,\n        drop_last=False,\n    )\n\n    # Class weights for imbalance handling\n    with torch.no_grad():\n        counts = torch.bincount(y_train.cpu(), minlength=num_classes).float()\n        class_weights = 1.0 / (counts + 1e-8)\n        class_weights = class_weights / class_weights.mean()\n\n    # Loss\n    class FocalLoss(nn.Module):\n        def __init__(self, alpha=None, gamma=1.5):\n            super().__init__()\n            self.register_buffer('alpha', alpha if alpha is not None else None)\n            self.gamma = gamma\n        def forward(self, logits, targets):\n            logp = nn.functional.log_softmax(logits, dim=-1)\n            p = logp.exp()\n            pt = p.gather(1, targets.view(-1, 1)).squeeze(1)\n            logpt = logp.gather(1, targets.view(-1, 1)).squeeze(1)\n            if self.alpha is not None:\n                at = self.alpha.gather(0, targets)\n            else:\n                at = 1.0\n            loss = -at * ((1 - pt).clamp(min=1e-6).pow(self.gamma)) * logpt\n            return loss.mean()\n\n    if loss_type == 'focal':\n        criterion = FocalLoss(alpha=class_weights.to(device), gamma=focal_gamma)\n    else:\n        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))\n\n    # Optimizer and AMP\n    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)\n    scaler = torch.cuda.amp.GradScaler(enabled=True)\n\n    # Training loop with early stopping\n    train_losses, val_losses, val_accs = [], [], []\n    best_state = None\n    best_val_loss = float('inf')\n    best_val_acc = 0.0\n    best_epoch = 0\n    no_improve = 0\n\n    for epoch in range(1, epochs + 1):\n        epoch_start = time.time()\n        model.train()\n        total_train_loss = 0.0\n        total_train_batches = 0\n\n        for xb, yb in train_loader:\n            xb = xb.to(device, non_blocking=True).float()\n            yb = yb.to(device, non_blocking=True).long()\n            optimizer.zero_grad(set_to_none=True)\n            with torch.cuda.amp.autocast(device_type='cuda', dtype=amp_torch_dtype):\n                logits = model(xb)\n                loss = criterion(logits, yb)\n            scaler.scale(loss).backward()\n            if grad_clip and grad_clip > 0:\n                scaler.unscale_(optimizer)\n                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)\n            scaler.step(optimizer)\n            scaler.update()\n            total_train_loss += loss.detach().item()\n            total_train_batches += 1\n\n        avg_train_loss = total_train_loss / max(1, total_train_batches)\n\n        # Validation\n        model.eval()\n        total_val_loss = 0.0\n        total_val_batches = 0\n        correct = 0\n        total = 0\n        with torch.no_grad():\n            for xb, yb in val_loader:\n                xb = xb.to(device, non_blocking=True).float()\n                yb = yb.to(device, non_blocking=True).long()\n                with torch.cuda.amp.autocast(device_type='cuda', dtype=amp_torch_dtype):\n                    logits = model(xb)\n                    loss = criterion(logits, yb)\n                total_val_loss += loss.item()\n                total_val_batches += 1\n                preds = logits.argmax(dim=-1)\n                correct += (preds == yb).sum().item()\n                total += yb.numel()\n\n        avg_val_loss = total_val_loss / max(1, total_val_batches)\n        val_acc = correct / max(1, total)\n\n        train_losses.append(avg_train_loss)\n        val_losses.append(avg_val_loss)\n        val_accs.append(val_acc)\n\n        epoch_time = time.time() - epoch_start\n        print(f\"Epoch {epoch}/{epochs} - train_loss: {avg_train_loss:.6f} - val_loss: {avg_val_loss:.6f} - val_acc: {val_acc:.6f} - time: {epoch_time:.2f}s\")\n\n        # Early stopping check\n        improved = avg_val_loss < (best_val_loss - 1e-6)\n        if improved:\n            best_val_loss = avg_val_loss\n            best_val_acc = val_acc\n            best_epoch = epoch\n            best_state = copy.deepcopy(model.state_dict())\n            no_improve = 0\n        else:\n            no_improve += 1\n            if no_improve >= patience:\n                break\n\n    # Load best checkpoint\n    if best_state is not None:\n        model.load_state_dict(best_state)\n\n    # -------------------- Temperature scaling on validation set --------------------\n    # Freeze other params\n    for p in model.parameters():\n        p.requires_grad = False\n    model.temperature.requires_grad = True\n    model.train()  # to allow grad on temperature; dropout won't affect as eval is better, but this is fine\n    temp_opt = optim.LBFGS([model.temperature], lr=0.5, max_iter=50, line_search_fn='strong_wolfe') if hasattr(optim, 'LBFGS') else optim.Adam([model.temperature], lr=0.01)\n    calib_criterion = nn.CrossEntropyLoss()  # standard CE for calibration\n\n    def closure():\n        temp_opt.zero_grad()\n        total_loss = 0.0\n        total_count = 0\n        for xb, yb in val_loader:\n            xb = xb.to(device, non_blocking=True).float()\n            yb = yb.to(device, non_blocking=True).long()\n            with torch.cuda.amp.autocast(device_type='cuda', dtype=amp_torch_dtype):\n                logits = model(xb)  # includes temperature\n                loss = calib_criterion(logits, yb)\n            (loss / 1.0).backward()\n            total_loss += loss.detach().item() * yb.size(0)\n            total_count += yb.size(0)\n        return torch.tensor(total_loss / max(1, total_count), dtype=torch.float32, device=device)\n\n    try:\n        if isinstance(temp_opt, optim.LBFGS):\n            temp_opt.step(closure)\n        else:\n            for _ in range(50):\n                temp_opt.zero_grad()\n                _ = closure()\n                temp_opt.step()\n    except Exception:\n        pass  # Temperature optimization is best-effort\n\n    model.eval()\n\n    # -------------------- Quantization (Post-training) --------------------\n    model_cpu = model.to('cpu')\n    q_model = model_cpu\n    try:\n        if quantization_bits == 32:\n            q_model = model_cpu  # no quantization\n        elif quantization_bits == 16:\n            if quantize_weights:\n                # Dynamic 16-bit weight-only quantization for Linear layers\n                q_model = torch.ao.quantization.quantize_dynamic(model_cpu, {nn.Linear}, dtype=torch.float16)\n            else:\n                q_model = model_cpu\n            if quantize_activations:\n                q_model = q_model.half()  # convert activations/weights to FP16\n        elif quantization_bits == 8:\n            if quantize_weights:\n                # Dynamic INT8 weight-only quantization for Linear layers\n                q_model = torch.ao.quantization.quantize_dynamic(model_cpu, {nn.Linear}, dtype=torch.qint8)\n            else:\n                q_model = model_cpu\n            # Activation quantization would require static quantization flow; omitted for simplicity\n        else:\n            q_model = model_cpu\n    except Exception:\n        q_model = model_cpu  # Fallback to unquantized if any issue\n\n    metrics = {\n        'train_losses': train_losses,\n        'val_losses': val_losses,\n        'val_acc': val_accs,\n        'best_epoch': best_epoch,\n        'best_val_acc': best_val_acc,\n        'temperature': float(torch.clamp(model.temperature.detach().cpu(), min=1e-3, max=100.0).item())\n    }\n\n    return q_model, metrics\n",
+  "bo_config": {
+    "lr": {
+      "default": 0.002,
+      "type": "Real",
+      "low": 1e-05,
+      "high": 0.02,
+      "prior": "log-uniform"
+    },
+    "batch_size": {
+      "default": 16384,
+      "type": "Categorical",
+      "categories": [2048, 4096, 8192, 16384, 32768]
+    },
+    "epochs": {
+      "default": 30,
+      "type": "Integer",
+      "low": 10,
+      "high": 60"
+    },
+    "hidden_size": {
+      "default": 256,
+      "type": "Integer",
+      "low": 128,
+      "high": 512
+    },
+    "num_layers": {
+      "default": 3,
+      "type": "Integer",
+      "low": 2,
+      "high": 5
+    },
+    "dropout": {
+      "default": 0.2,
+      "type": "Real",
+      "low": 0.0,
+      "high": 0.4
+    },
+    "weight_decay": {
+      "default": 0.001,
+      "type": "Real",
+      "low": 1e-06,
+      "high": 0.01,
+      "prior": "log-uniform"
+    },
+    "n_frequencies": {
+      "default": 4,
+      "type": "Integer",
+      "low": 2,
+      "high": 8
+    },
+    "loss_type": {
+      "default": "ce",
+      "type": "Categorical",
+      "categories": ["ce", "focal"]
+    },
+    "focal_gamma": {
+      "default": 1.5,
+      "type": "Real",
+      "low": 1.0,
+      "high": 3.0
+    },
+    "amp_dtype": {
+      "default": "fp16",
+      "type": "Categorical",
+      "categories": ["fp16", "bf16"]
+    },
+    "grad_clip": {
+      "default": 1.0,
+      "type": "Real",
+      "low": 0.0,
+      "high": 2.0
+    },
+    "patience": {
+      "default": 5,
+      "type": "Integer",
+      "low": 3,
+      "high": 10
+    },
+    "quantization_bits": {
+      "default": 8,
+      "type": "Categorical",
+      "categories": [8, 16, 32]
+    },
+    "quantize_weights": {
+      "default": true,
+      "type": "Categorical",
+      "categories": [true, false]
+    },
+    "quantize_activations": {
+      "default": false,
+      "type": "Categorical",
+      "categories": [true, false]
+    }
+  },
+  "confidence": 0.86
+}
+
+Fixed JSON:
+{
+  "model_name": "RealMLP-TD",
+  "training_code": "def train_model(X_train, y_train, X_val, y_val, device, **hyperparams):\n    import torch\n    from torch import nn, optim\n    from torch.utils.data import TensorDataset, DataLoader\n    import math, time, copy\n\n    # Device handling (ALWAYS GPU for training)\n    device = torch.device(device)\n    if not torch.cuda.is_available() or device.type != 'cuda':\n        raise RuntimeError('CUDA GPU is required for training. Pass device=\"cuda\" and ensure a GPU is available.')\n    torch.backends.cudnn.benchmark = True\n\n    # -------------------- Hyperparameters (only accuracy/compression affecting) --------------------\n    lr = float(hyperparams.get('lr', 2e-3))\n    batch_size = int(hyperparams.get('batch_size', 16384))\n    epochs = int(hyperparams.get('epochs', 30))\n    hidden_size = int(hyperparams.get('hidden_size', 256))\n    num_layers = int(hyperparams.get('num_layers', 3))\n    dropout = float(hyperparams.get('dropout', 0.2))\n    weight_decay = float(hyperparams.get('weight_decay', 1e-3))\n    n_frequencies = int(hyperparams.get('n_frequencies', 4))\n    loss_type = hyperparams.get('loss_type', 'ce')\n    focal_gamma = float(hyperparams.get('focal_gamma', 1.5))\n    amp_dtype = hyperparams.get('amp_dtype', 'fp16')  # 'fp16' or 'bf16'\n    grad_clip = float(hyperparams.get('grad_clip', 1.0))\n    patience = int(hyperparams.get('patience', 5))\n    quantization_bits = int(hyperparams.get('quantization_bits', 8))  # 8,16,32\n    quantize_weights = bool(hyperparams.get('quantize_weights', True))\n    quantize_activations = bool(hyperparams.get('quantize_activations', False))\n\n    # Choose autocast dtype\n    amp_torch_dtype = torch.float16 if amp_dtype.lower() == 'fp16' else torch.bfloat16\n\n    # -------------------- Model Definition --------------------\n    class RobustScaler(nn.Module):\n        def __init__(self, in_features, clip_value=3.0, eps=1e-6):\n            super().__init__()\n            self.register_buffer('median', torch.zeros(in_features))\n            self.register_buffer('iqr', torch.ones(in_features))\n            self.clip_value = clip_value\n            self.eps = eps\n        @torch.no_grad()\n        def set_stats(self, median, iqr):\n            iqr_clamped = iqr.clone()\n            iqr_clamped[iqr_clamped < 1e-6] = 1.0\n            self.median.copy_(median)\n            self.iqr.copy_(iqr_clamped)\n        def forward(self, x):\n            z = (x - self.median) / (self.iqr + self.eps)\n            if self.clip_value is not None:\n                z = self.clip_value * torch.tanh(z / self.clip_value)\n            return z\n\n    class NumericEmbedding(nn.Module):\n        def __init__(self, in_features, n_frequencies=4):\n            super().__init__()\n            self.in_features = in_features\n            self.n_frequencies = n_frequencies\n            # Log-spaced periodic frequencies\n            freqs = torch.logspace(math.log10(0.5), math.log10(32.0), steps=n_frequencies)\n            self.register_buffer('freqs', freqs)\n            self.out_dim = in_features * (1 + 2 * n_frequencies)\n            # Diagonal feature-scaling after embedding\n            self.scale = nn.Parameter(torch.ones(self.out_dim))\n        def forward(self, x):  # x: [B, F]\n            B, F = x.shape\n            x_exp = x.unsqueeze(-1)  # [B, F, 1]\n            angles = 2 * math.pi * x_exp * self.freqs.view(1, 1, -1)  # [B, F, nf]\n            s = torch.sin(angles)\n            c = torch.cos(angles)\n            feat = torch.cat([x_exp, s, c], dim=2)  # [B, F, 1 + 2*nf]\n            feat = feat.reshape(B, F * (1 + 2 * self.n_frequencies))  # [B, out_dim]\n            return feat * self.scale  # diagonal feature scaling\n\n    class RealMLPTD(nn.Module):\n        def __init__(self, in_features, num_classes, hidden_size=256, num_layers=3, dropout=0.2, n_frequencies=4, clip_value=3.0):\n            super().__init__()\n            self.scaler = RobustScaler(in_features, clip_value=clip_value)\n            self.embed = NumericEmbedding(in_features, n_frequencies=n_frequencies)\n            layers = []\n            in_dim = self.embed.out_dim\n            for i in range(num_layers):\n                d_in = in_dim if i == 0 else hidden_size\n                d_out = hidden_size\n                layers.append(nn.Linear(d_in, d_out))\n                layers.append(nn.GELU())\n                layers.append(nn.Dropout(dropout))\n            self.backbone = nn.Sequential(*layers)\n            self.head = nn.Linear(hidden_size, num_classes)\n            # Temperature scaling parameter (learned post-training)\n            self.temperature = nn.Parameter(torch.ones(1))\n        def forward(self, x):\n            x = self.scaler(x)\n            x = self.embed(x)\n            x = self.backbone(x)\n            logits = self.head(x)\n            T = torch.clamp(self.temperature, min=1e-3, max=100.0)\n            return logits / T\n\n    # -------------------- Dataset and Stats --------------------\n    num_classes = 3\n    in_features = X_train.shape[1]\n\n    # Ensure dtypes\n    X_train = X_train.contiguous()\n    X_val = X_val.contiguous()\n    y_train = y_train.long().contiguous()\n    y_val = y_val.long().contiguous()\n\n    # Compute robust stats on CPU to save GPU memory\n    with torch.no_grad():\n        Xtr_cpu = X_train.float()\n        median = torch.median(Xtr_cpu, dim=0).values\n        q25, q75 = torch.quantile(Xtr_cpu, torch.tensor([0.25, 0.75]), dim=0)\n        iqr = q75 - q25\n\n    # Build model and set stats\n    model = RealMLPTD(in_features=in_features, num_classes=num_classes,\n                      hidden_size=hidden_size, num_layers=num_layers,\n                      dropout=dropout, n_frequencies=n_frequencies, clip_value=3.0)\n    model.to(device)\n    with torch.no_grad():\n        model.scaler.set_stats(median.to(device), iqr.to(device))\n\n    # DataLoaders with CUDA-friendly settings\n    mp_ctx = torch.multiprocessing.get_context('spawn')\n    num_workers = 8\n    train_ds = TensorDataset(X_train, y_train)\n    val_ds = TensorDataset(X_val, y_val)\n    train_loader = DataLoader(\n        train_ds,\n        batch_size=batch_size,\n        shuffle=True,\n        num_workers=num_workers,\n        pin_memory=True,\n        persistent_workers=True,\n        prefetch_factor=2,\n        multiprocessing_context=mp_ctx,\n        drop_last=False,\n    )\n    val_loader = DataLoader(\n        val_ds,\n        batch_size=batch_size,\n        shuffle=False,\n        num_workers=num_workers,\n        pin_memory=True,\n        persistent_workers=True,\n        prefetch_factor=2,\n        multiprocessing_context=mp_ctx,\n        drop_last=False,\n    )\n\n    # Class weights for imbalance handling\n    with torch.no_grad():\n        counts = torch.bincount(y_train.cpu(), minlength=num_classes).float()\n        class_weights = 1.0 / (counts + 1e-8)\n        class_weights = class_weights / class_weights.mean()\n\n    # Loss\n    class FocalLoss(nn.Module):\n        def __init__(self, alpha=None, gamma=1.5):\n            super().__init__()\n            self.register_buffer('alpha', alpha if alpha is not None else None)\n            self.gamma = gamma\n        def forward(self, logits, targets):\n            logp = nn.functional.log_softmax(logits, dim=-1)\n            p = logp.exp()\n            pt = p.gather(1, targets.view(-1, 1)).squeeze(1)\n            logpt = logp.gather(1, targets.view(-1, 1)).squeeze(1)\n            if self.alpha is not None:\n                at = self.alpha.gather(0, targets)\n            else:\n                at = 1.0\n            loss = -at * ((1 - pt).clamp(min=1e-6).pow(self.gamma)) * logpt\n            return loss.mean()\n\n    if loss_type == 'focal':\n        criterion = FocalLoss(alpha=class_weights.to(device), gamma=focal_gamma)\n    else:\n        criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))\n\n    # Optimizer and AMP\n    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)\n    scaler = torch.cuda.amp.GradScaler(enabled=True)\n\n    # Training loop with early stopping\n    train_losses, val_losses, val_accs = [], [], []\n    best_state = None\n    best_val_loss = float('inf')\n    best_val_acc = 0.0\n    best_epoch = 0\n    no_improve = 0\n\n    for epoch in range(1, epochs + 1):\n        epoch_start = time.time()\n        model.train()\n        total_train_loss = 0.0\n        total_train_batches = 0\n\n        for xb, yb in train_loader:\n            xb = xb.to(device, non_blocking=True).float()\n            yb = yb.to(device, non_blocking=True).long()\n            optimizer.zero_grad(set_to_none=True)\n            with torch.cuda.amp.autocast(device_type='cuda', dtype=amp_torch_dtype):\n                logits = model(xb)\n                loss = criterion(logits, yb)\n            scaler.scale(loss).backward()\n            if grad_clip and grad_clip > 0:\n                scaler.unscale_(optimizer)\n                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)\n            scaler.step(optimizer)\n            scaler.update()\n            total_train_loss += loss.detach().item()\n            total_train_batches += 1\n\n        avg_train_loss = total_train_loss / max(1, total_train_batches)\n\n        # Validation\n        model.eval()\n        total_val_loss = 0.0\n        total_val_batches = 0\n        correct = 0\n        total = 0\n        with torch.no_grad():\n            for xb, yb in val_loader:\n                xb = xb.to(device, non_blocking=True).float()\n                yb = yb.to(device, non_blocking=True).long()\n                with torch.cuda.amp.autocast(device_type='cuda', dtype=amp_torch_dtype):\n                    logits = model(xb)\n                    loss = criterion(logits, yb)\n                total_val_loss += loss.item()\n                total_val_batches += 1\n                preds = logits.argmax(dim=-1)\n                correct += (preds == yb).sum().item()\n                total += yb.numel()\n\n        avg_val_loss = total_val_loss / max(1, total_val_batches)\n        val_acc = correct / max(1, total)\n\n        train_losses.append(avg_train_loss)\n        val_losses.append(avg_val_loss)\n        val_accs.append(val_acc)\n\n        epoch_time = time.time() - epoch_start\n        print(f\"Epoch {epoch}/{epochs} - train_loss: {avg_train_loss:.6f} - val_loss: {avg_val_loss:.6f} - val_acc: {val_acc:.6f} - time: {epoch_time:.2f}s\")\n\n        # Early stopping check\n        improved = avg_val_loss < (best_val_loss - 1e-6)\n        if improved:\n            best_val_loss = avg_val_loss\n            best_val_acc = val_acc\n            best_epoch = epoch\n            best_state = copy.deepcopy(model.state_dict())\n            no_improve = 0\n        else:\n            no_improve += 1\n            if no_improve >= patience:\n                break\n\n    # Load best checkpoint\n    if best_state is not None:\n        model.load_state_dict(best_state)\n\n    # -------------------- Temperature scaling on validation set --------------------\n    # Freeze other params\n    for p in model.parameters():\n        p.requires_grad = False\n    model.temperature.requires_grad = True\n    model.train()  # to allow grad on temperature; dropout won't affect as eval is better, but this is fine\n    temp_opt = optim.LBFGS([model.temperature], lr=0.5, max_iter=50, line_search_fn='strong_wolfe') if hasattr(optim, 'LBFGS') else optim.Adam([model.temperature], lr=0.01)\n    calib_criterion = nn.CrossEntropyLoss()  # standard CE for calibration\n\n    def closure():\n        temp_opt.zero_grad()\n        total_loss = 0.0\n        total_count = 0\n        for xb, yb in val_loader:\n            xb = xb.to(device, non_blocking=True).float()\n            yb = yb.to(device, non_blocking=True).long()\n            with torch.cuda.amp.autocast(device_type='cuda', dtype=amp_torch_dtype):\n                logits = model(xb)  # includes temperature\n                loss = calib_criterion(logits, yb)\n            (loss / 1.0).backward()\n            total_loss += loss.detach().item() * yb.size(0)\n            total_count += yb.size(0)\n        return torch.tensor(total_loss / max(1, total_count), dtype=torch.float32, device=device)\n\n    try:\n        if isinstance(temp_opt, optim.LBFGS):\n            temp_opt.step(closure)\n        else:\n            for _ in range(50):\n                temp_opt.zero_grad()\n                _ = closure()\n                temp_opt.step()\n    except Exception:\n        pass  # Temperature optimization is best-effort\n\n    model.eval()\n\n    # -------------------- Quantization (Post-training) --------------------\n    model_cpu = model.to('cpu')\n    q_model = model_cpu\n    try:\n        if quantization_bits == 32:\n            q_model = model_cpu  # no quantization\n        elif quantization_bits == 16:\n            if quantize_weights:\n                # Dynamic 16-bit weight-only quantization for Linear layers\n                q_model = torch.ao.quantization.quantize_dynamic(model_cpu, {nn.Linear}, dtype=torch.float16)\n            else:\n                q_model = model_cpu\n            if quantize_activations:\n                q_model = q_model.half()  # convert activations/weights to FP16\n        elif quantization_bits == 8:\n            if quantize_weights:\n                # Dynamic INT8 weight-only quantization for Linear layers\n                q_model = torch.ao.quantization.quantize_dynamic(model_cpu, {nn.Linear}, dtype=torch.qint8)\n            else:\n                q_model = model_cpu\n            # Activation quantization would require static quantization flow; omitted for simplicity\n        else:\n            q_model = model_cpu\n    except Exception:\n        q_model = model_cpu  # Fallback to unquantized if any issue\n\n    metrics = {\n        'train_losses': train_losses,\n        'val_losses': val_losses,\n        'val_acc': val_accs,\n        'best_epoch': best_epoch,\n        'best_val_acc': best_val_acc,\n        'temperature': float(torch.clamp(model.temperature.detach().cpu(), min=1e-3, max=100.0).item())\n    }\n\n    return q_model, metrics\n",
+  "bo_config": {
+    "lr": {
+      "default": 0.002,
+      "type": "Real",
+      "low": 1e-05,
+      "high": 0.02,
+      "prior": "log-uniform"},
+    "batch_size": {
+      "default": 16384,
+      "type": "Categorical",
+      "categories": [2048, 4096, 8192, 16384, 32768]
+    },
+    "epochs": {
+      "default": 30,
+      "type": "Integer",
+      "low": 10,
+      "high": 60},
+    "hidden_size": {
+      "default": 256,
+      "type": "Integer",
+      "low": 128,
+      "high": 512
+    },
+    "num_layers": {
+      "default": 3,
+      "type": "Integer",
+      "low": 2,
+      "high": 5
+    },
+    "dropout": {
+      "default": 0.2,
+      "type": "Real",
+      "low": 0.0,
+      "high": 0.4
+    },
+    "weight_decay": {
+      "default": 0.001,
+      "type": "Real",
+      "low": 1e-06,
+      "high": 0.01,
+      "prior": "log-uniform"},
+    "n_frequencies": {
+      "default": 4,
+      "type": "Integer",
+      "low": 2,
+      "high": 8
+    },
+    "loss_type": {
+      "default": "ce",
+      "type": "Categorical",
+      "categories": ["ce", "focal"]
+    },
+    "focal_gamma": {
+      "default": 1.5,
+      "type": "Real",
+      "low": 1.0,
+      "high": 3.0
+    },
+    "amp_dtype": {
+      "default": "fp16,
+      "type": "Categorical",
+      "categories": ["fp16, "bf16"]
+    },
+    "grad_clip": {
+      "default": 1.0,
+      "type": "Real",
+      "low": 0.0,
+      "high": 2.0
+    },
+    "patience": {
+      "default": 5,
+      "type": "Integer",
+      "low": 3,
+      "high": 10
+    },
+    "quantization_bits": {
+      "default": 8,
+      "type": "Categorical",
+      "categories": [8, 16, 32]
+    },
+    "quantize_weights": {
+      "default": true,
+      "type": "Categorical",
+      "categories": [true, false]
+    },
+    "quantize_activations": {
+      "default": false,
+      "type": "Categorical",
+      "categories": [true, false]
+    }
+  },
+  "confidence": 0.86
+}
