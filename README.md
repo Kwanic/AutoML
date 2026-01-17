@@ -413,7 +413,7 @@ If you use this pipeline in your research, please cite:
 @software{automl_gpt,
   title={AutoML-GPT: AI-Powered Neural Architecture Generation with GPT-5},
   author={Zhikaun Zhang},{Austin Zhuang},{Shiyuan Duan},
-  year={2025},
+  year={2026},
   url={https://github.com/Kwanic/AutoML}
 }
 ```
