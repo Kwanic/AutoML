@@ -267,8 +267,7 @@ ml_pipeline/
 ├── visualization.py                        # BO charts generation
 ├── main.py                                 # Main pipeline entry point
 ├── setup_api_key.py                        # Interactive API setup
-├── requirements.txt                        # Python dependencies
-└── CLAUDE.md                               # Development instructions
+└── requirements.txt                        # Python dependencies
 ```
 
 ## Configuration
