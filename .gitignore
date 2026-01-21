@@ -71,14 +71,6 @@ test_*.py
 
 # Data
 data/dataset1/
-data/dataset2/
-data/dataset3/
-data/dataset4/
-data/dataset5/
-data/dataset6/
-data/dataset7/
-data/dataset8/
-data/dataset9/
 
 *.npy
 
