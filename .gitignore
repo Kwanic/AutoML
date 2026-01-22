@@ -69,21 +69,6 @@ Thumbs.db
 test_*.py
 *_test.py
 
-# Data
-data/dataset1/
-
-*.npy
-
 backup/
 
-charts/
-
-data/
-
-generated_training_functions/
-gpt_debug_responses/
-logs/
-
-trained_models/
-literature_reviews/
 graph/
