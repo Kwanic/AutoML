@@ -1,19 +1,22 @@
-# Data
+# Dataset1 - MIT-BIH ECG Example
 
-This folder contains datasets used for training and evaluation.
+Example dataset for ECG arrhythmia classification.
 
-## Structure
+## Files
 
-- **`mitdb/`** - MIT-BIH Arrhythmia Database for ECG analysis
-- Raw data files in various formats (CSV, images, sequences, etc.)
-- Data is processed by the universal converter in the `adapters/` module
+- `X.npy` - ECG features (62352, 1000, 2)
+- `y.npy` - Labels (5 classes)
+- `mitdb_ecg_data.npz` - Compressed version
+- `mitdb_ecg_sample.csv` - Sample data
+- `mitdb_metadata.json` - Dataset metadata
+- `sample_ecg_visualization.png` - Visualization
 
-## Usage
+## Dataset Info
 
-The pipeline automatically detects and converts data from this folder using the Universal Data Converter, which:
-- Analyzes data characteristics
-- Creates appropriate DataProfile objects
-- Converts to PyTorch tensor format
-- Handles tabular, image, sequence, and custom data types
+- **Source:** MIT-BIH Arrhythmia Database
+- **Samples:** 62,352
+- **Sequence Length:** 1,000
+- **Features:** 2 (dual-lead ECG)
+- **Classes:** 5
 
-Place your datasets here for automatic processing by the ML pipeline.
+This is an example dataset. Replace with your own data in the same format.
